@@ -1,60 +1,42 @@
-"""PyTorch dataset orchestration for MIL-based tuberculosis detection.
+"""PyTorch MIL dataset orchestration for tuberculosis detection.
 
-This module acts as the integration layer between the preprocessing,
-augmentation and patch extraction components. It does not reimplement their
-logic; instead, it injects those dependencies and orchestrates them in a
-PyTorch Dataset compatible with MIL pipelines such as ABMIL, CLAM, DSMIL and
-TransMIL.
+This module is intentionally thin: it uses dependency injection to delegate
+preprocessing, augmentation and patch extraction to dedicated classes.
 """
 
 from __future__ import annotations
 
 import csv
-import sys
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-MODULE_DIR = Path(__file__).resolve().parent
-if str(MODULE_DIR) not in sys.path:
-    sys.path.insert(0, str(MODULE_DIR))
-
-try:
-    from preprocessing import preprocess_image  # type: ignore
-except ImportError:  # pragma: no cover - optional import
-    preprocess_image = None
-
-try:
-    from patch_extraction import extract_patches_from_image  # type: ignore
-except ImportError:  # pragma: no cover - optional import
-    extract_patches_from_image = None
-
+from .patch_extraction import PatchExtractor
+from .preprocessing import Preprocessor
+from .augmentations import DatasetAugmenter
 
 ImagePath = Union[str, Path]
 LabelValue = Union[int, float, str]
 
 
 class TBDataset(Dataset):
-    """PyTorch Dataset for MIL bags built from chest X-ray images.
+    """Create MIL bags from chest X-ray images stored in a CSV file.
 
-    The dataset reads a CSV file containing image paths and labels, applies the
-    configured preprocessing and optional minority-class augmentation, extracts
-    patches, and returns a bag of patches for each image. The dataset is
-    designed to be compatible with MIL models that operate on bags of patches.
-
-    The implementation is intentionally modular: preprocessing, augmentation and
-    patch extraction are injected from outside and are not reimplemented here.
+    Each sample is processed through the injected preprocessor, optional
+    minority-class augmenter and patch extractor. The dataset returns a bag of
+    patches together with the label, coordinates and metadata required by MIL
+    models.
     """
 
     def __init__(
         self,
         csv_file: ImagePath,
-        preprocessor: Optional[Callable[[ImagePath], np.ndarray]] = None,
-        patch_extractor: Optional[Callable[..., Any]] = None,
-        augmenter: Optional[Any] = None,
+        preprocessor: Preprocessor,
+        patch_extractor: PatchExtractor,
+        augmenter: Optional[DatasetAugmenter] = None,
         train: bool = True,
         image_column: str = "image_path",
         label_column: str = "label",
@@ -64,12 +46,12 @@ class TBDataset(Dataset):
         empty_threshold: float = 0.05,
         minority_class: str = "TB",
         label_mapping: Optional[Dict[str, int]] = None,
-        cache: bool = True,
+        cache: bool = False,
     ) -> None:
-        """Initialize the dataset from a CSV file and injected processing modules."""
+        """Initialize the dataset from a CSV file and injected processing objects."""
         self.csv_file = Path(csv_file)
-        self.preprocessor = self._resolve_preprocessor(preprocessor)
-        self.patch_extractor = self._resolve_patch_extractor(patch_extractor)
+        self.preprocessor = preprocessor
+        self.patch_extractor = patch_extractor
         self.augmenter = augmenter
         self.train = train
         self.image_column = image_column
@@ -84,40 +66,9 @@ class TBDataset(Dataset):
 
         self.samples = self._load_csv_samples()
         self._cache: Dict[int, Dict[str, Any]] = {}
-        self.class_distribution = self.get_class_distribution()
-
-    def _resolve_preprocessor(self, preprocessor: Optional[Callable[[ImagePath], np.ndarray]]) -> Callable[[ImagePath], np.ndarray]:
-        """Resolve a preprocessor callable from an injected object or a fallback helper."""
-        if preprocessor is not None:
-            if callable(preprocessor):
-                return preprocessor
-            if hasattr(preprocessor, "preprocess") and callable(preprocessor.preprocess):
-                return preprocessor.preprocess
-            if hasattr(preprocessor, "preprocess_image") and callable(preprocessor.preprocess_image):
-                return preprocessor.preprocess_image
-
-        if preprocess_image is not None:
-            return preprocess_image
-
-        raise ValueError("A preprocessor must be provided or available as preprocess_image().")
-
-    def _resolve_patch_extractor(self, patch_extractor: Optional[Callable[..., Any]]) -> Callable[..., Any]:
-        """Resolve a patch extractor callable from an injected object or a fallback helper."""
-        if patch_extractor is not None:
-            if callable(patch_extractor):
-                return patch_extractor
-            if hasattr(patch_extractor, "extract_patches_from_image") and callable(patch_extractor.extract_patches_from_image):
-                return patch_extractor.extract_patches_from_image
-            if hasattr(patch_extractor, "extract_patches") and callable(patch_extractor.extract_patches):
-                return patch_extractor.extract_patches
-
-        if extract_patches_from_image is not None:
-            return extract_patches_from_image
-
-        raise ValueError("A patch extractor must be provided or available as extract_patches_from_image().")
 
     def _load_csv_samples(self) -> List[Dict[str, Any]]:
-        """Load the CSV file and validate its structure."""
+        """Validate and load samples from the CSV file."""
         if not self.csv_file.exists():
             raise FileNotFoundError(f"CSV file not found: {self.csv_file}")
 
@@ -133,16 +84,17 @@ class TBDataset(Dataset):
 
             rows: List[Dict[str, Any]] = []
             for row_index, row in enumerate(reader, start=2):
-                image_path = (row.get(self.image_column) or "").strip()
-                if not image_path:
+                image_path_value = (row.get(self.image_column) or "").strip()
+                if not image_path_value:
                     raise ValueError(f"Empty image path at row {row_index}.")
 
-                image_path = (self.csv_file.parent / image_path).resolve() if not Path(image_path).is_absolute() else Path(image_path)
+                image_path = Path(image_path_value)
+                if not image_path.is_absolute():
+                    image_path = (self.csv_file.parent / image_path).resolve()
                 if not image_path.exists():
                     raise FileNotFoundError(f"Image file not found: {image_path}")
 
-                label_raw = row.get(self.label_column)
-                label_value = self._parse_label(label_raw)
+                label_value = self._parse_label(row.get(self.label_column))
                 rows.append({"image_path": str(image_path), "label": label_value})
 
             if not rows:
@@ -151,7 +103,7 @@ class TBDataset(Dataset):
             return rows
 
     def _parse_label(self, label_raw: Optional[LabelValue]) -> int:
-        """Convert a label from the CSV to an integer value expected by PyTorch."""
+        """Convert a label from the CSV file to the expected integer format."""
         if label_raw is None:
             raise ValueError("Label value is missing.")
 
@@ -176,48 +128,21 @@ class TBDataset(Dataset):
             return 1
         if normalized == "NORMAL":
             return 0
-
         raise ValueError(f"Invalid label {label_raw}; expected one of {sorted(self.label_mapping)} or 0/1.")
 
-    def _is_minority_label(self, label: int) -> bool:
-        """Check whether the current label matches the configured minority class."""
-        if not self.label_mapping:
-            return False
-        for name, value in self.label_mapping.items():
-            if value == label and name == self.minority_class:
-                return True
-        return False
-
     def _apply_augmentation(self, image: np.ndarray, label: int) -> np.ndarray:
-        """Apply augmentation only in training mode and for the minority class."""
-        if not self.train or self.augmenter is None:
+        """Apply augmentation only for training and for the minority class."""
+        if self.augmenter is None or not self.train:
             return image
-        if not self._is_minority_label(label):
-            return image
-
-        if hasattr(self.augmenter, "transform") and getattr(self.augmenter, "transform", None) is not None:
-            transformed = self.augmenter.transform(image=image)
-            if isinstance(transformed, dict):
-                return transformed["image"]
-            return transformed
-
-        if hasattr(self.augmenter, "augment_sample") and callable(self.augmenter.augment_sample):
-            augmented_image, _ = self.augmenter.augment_sample(image, label)
-            return np.asarray(augmented_image)
-
-        if callable(self.augmenter):
-            return np.asarray(self.augmenter(image))
-
-        return image
+        return self.augmenter.apply(image, label)
 
     def _prepare_sample(self, index: int) -> Dict[str, Any]:
-        """Prepare one sample by running preprocessing, augmentation and patch extraction."""
+        """Run preprocessing, augmentation and patch extraction for one sample."""
         sample = self.samples[index]
         image_path = Path(sample["image_path"])
 
         try:
-            preprocessed = self.preprocessor(image_path)
-            image_array = np.asarray(preprocessed)
+            image_array = self.preprocessor.preprocess(image_path)
         except Exception as exc:  # pragma: no cover - runtime validation path
             raise ValueError(f"Unable to preprocess image at {image_path}: {exc}") from exc
 
@@ -230,7 +155,7 @@ class TBDataset(Dataset):
             raise ValueError(f"Unable to augment image at {image_path}: {exc}") from exc
 
         try:
-            patches, coords = self.patch_extractor(
+            patches, coords = self.patch_extractor.extract(
                 image_array,
                 patch_size=self.patch_size,
                 overlap=self.overlap,
@@ -244,9 +169,6 @@ class TBDataset(Dataset):
             raise ValueError(f"Bag is empty after patch extraction for {image_path}.")
 
         patch_tensors = [torch.from_numpy(np.transpose(np.asarray(patch), (2, 0, 1))).float() for patch in patches]
-        if not patch_tensors:
-            raise ValueError(f"No patches produced for {image_path}.")
-
         patches_tensor = torch.stack(patch_tensors, dim=0)
         label_tensor = torch.tensor(int(sample["label"]), dtype=torch.long)
 
@@ -263,7 +185,7 @@ class TBDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, index: int) -> Dict[str, Any]:
-        """Return one MIL bag as a dictionary suitable for PyTorch training."""
+        """Return one sample as a MIL bag-compatible dictionary."""
         if index < 0 or index >= len(self):
             raise IndexError(f"Index {index} is out of bounds for dataset of size {len(self)}.")
 
@@ -276,7 +198,7 @@ class TBDataset(Dataset):
         return prepared
 
     def get_class_distribution(self) -> Dict[str, int]:
-        """Return a summary of the class distribution in the loaded CSV file."""
+        """Return the class distribution present in the CSV file."""
         counts: Dict[str, int] = {}
         for sample in self.samples:
             label = int(sample["label"])
@@ -285,14 +207,13 @@ class TBDataset(Dataset):
         return counts
 
     def print_dataset_summary(self) -> None:
-        """Print a compact summary of the loaded dataset."""
+        """Print a concise summary of the dataset content."""
         distribution = self.get_class_distribution()
         print("-" * 34)
         print("Dataset summary")
         print("-" * 34)
         for class_name in ["Normal", "TB"]:
-            count = distribution.get(class_name, 0)
-            print(f"{class_name} : {count}")
+            print(f"{class_name} : {distribution.get(class_name, 0)}")
         print()
         print(f"Samples : {len(self)}")
         print(f"Mode : {'train' if self.train else 'eval'}")
@@ -300,48 +221,34 @@ class TBDataset(Dataset):
 
 
 def collate_mil_batch(batch: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
-    """Simple collate function for variable-length MIL bags.
-
-    This function preserves the per-sample patch lists instead of padding them,
-    which is appropriate for MIL pipelines that handle bags of variable size.
-    """
+    """Collate a batch of variable-sized MIL bags without padding."""
     labels = torch.stack([item["label"] for item in batch], dim=0)
-    paths = [item["path"] for item in batch]
-    coords = [item["coords"] for item in batch]
-    num_patches = [item["num_patches"] for item in batch]
-    patches = [item["patches"] for item in batch]
-    return {"patches": patches, "coords": coords, "label": labels, "path": paths, "num_patches": num_patches}
+    return {
+        "patches": [item["patches"] for item in batch],
+        "coords": [item["coords"] for item in batch],
+        "label": labels,
+        "path": [item["path"] for item in batch],
+        "num_patches": [item["num_patches"] for item in batch],
+    }
 
 
 if __name__ == "__main__":
-    """Minimal end-to-end example for using the dataset with a preprocessor, patch extractor and augmenter."""
     from torch.utils.data import DataLoader
 
-    # Example placeholders; replace them with your own project components.
-    preprocessor = preprocess_image
-    patch_extractor = extract_patches_from_image
-
-    try:
-        from augmentation import DatasetBalancer
-
-        augmenter = DatasetBalancer(input_dir="dataset", output_dir="balanced_dataset")
-    except Exception:  # pragma: no cover - optional dependency path
-        augmenter = None
+    preprocessor = Preprocessor(target_size=(512, 512), normalization="imagenet")
+    patch_extractor = PatchExtractor(patch_size=(256, 256), overlap=0.0)
+    augmenter = DatasetAugmenter(train=True, minority_class="TB")
 
     dataset = TBDataset(
         csv_file="data/metadata.csv",
         preprocessor=preprocessor,
         patch_extractor=patch_extractor,
         augmenter=augmenter,
-        train=True,
-        patch_size=(256, 256),
-        overlap=0.0,
     )
     dataset.print_dataset_summary()
 
     loader = DataLoader(dataset, batch_size=2, collate_fn=collate_mil_batch)
     batch = next(iter(loader))
-    print(type(batch["patches"]))
     print(batch["label"].shape)
     print(batch["num_patches"])
 
